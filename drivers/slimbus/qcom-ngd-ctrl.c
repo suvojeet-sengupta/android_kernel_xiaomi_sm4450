@@ -1946,7 +1946,7 @@ static int of_qcom_slim_ngd_register(struct device *parent,
 			of_node_put(node);
 			return ret;
 		}
-		ngd->pdev->dev.of_node = node;
+		ngd->pdev->dev.of_node = of_node_get(node);
 		ctrl->ngd = ngd;
 
 		ret = platform_device_add(ngd->pdev);
@@ -1991,6 +1991,13 @@ static ssize_t debug_mask_store(struct device *device,
 
 static DEVICE_ATTR_RW(debug_mask);
 
+static void qcom_slim_ngd_unregister(struct qcom_slim_ngd_ctrl *ctrl)
+{
+	struct qcom_slim_ngd *ngd = ctrl->ngd;
+
+	platform_device_del(ngd->pdev);
+}
+
 static int qcom_slim_ngd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2012,6 +2019,14 @@ static int qcom_slim_ngd_probe(struct platform_device *pdev)
 	pm_runtime_get_noresume(dev);
 	SLIM_INFO(ctrl, "SLIM %s:PM get_noresume count:%d\n", __func__,
 		atomic_read(&ctrl->ctrl.dev->power.usage_count));
+	ret = qcom_slim_ngd_qmi_svc_event_init(ctrl);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"QMI service registration failed:%d\n", ret);
+		goto err_pm;
+	}
+
+
 
 	INIT_WORK(&ctrl->m_work, qcom_slim_ngd_master_worker);
 	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
@@ -2021,19 +2036,15 @@ static int qcom_slim_ngd_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto wq_err;
 	}
-	ret = qcom_slim_ngd_qmi_svc_event_init(ctrl);
-	if (ret) {
-		dev_err(&pdev->dev,
-			"QMI service registration failed:%d\n", ret);
-		goto err;
-	}
 
 	return 0;
 wq_err:
 	qcom_slim_ngd_qmi_svc_event_deinit(&ctrl->qmi);
 	if (ctrl->mwq)
 		destroy_workqueue(ctrl->mwq);
-err:
+err_pm:
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_disable(dev);
 	slim_unregister_controller(&ctrl->ctrl);
 
 	return ret;
@@ -2218,6 +2229,7 @@ static int qcom_slim_ngd_ctrl_remove(struct platform_device *pdev)
 
 	ipc_log_context_destroy(ctrl->ipc_slimbus_log);
 	ctrl->ipc_slimbus_log = NULL;
+	qcom_slim_ngd_unregister(ctrl);
 
 	return 0;
 }
@@ -2226,6 +2238,7 @@ static int qcom_slim_ngd_remove(struct platform_device *pdev)
 {
 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
 
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	pdr_handle_release(ctrl->pdr);
 	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
@@ -2338,6 +2351,28 @@ static struct platform_driver qcom_slim_ngd_driver = {
 	},
 };
 
-module_platform_driver(qcom_slim_ngd_ctrl_driver);
+static int qcom_slim_ngd_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&qcom_slim_ngd_driver);
+	if (ret)
+		return ret;
+
+	ret = platform_driver_register(&qcom_slim_ngd_ctrl_driver);
+	if (ret)
+		platform_driver_unregister(&qcom_slim_ngd_driver);
+
+	return ret;
+}
+
+static void qcom_slim_ngd_exit(void)
+{
+	platform_driver_unregister(&qcom_slim_ngd_ctrl_driver);
+	platform_driver_unregister(&qcom_slim_ngd_driver);
+}
+
+module_init(qcom_slim_ngd_init);
+module_exit(qcom_slim_ngd_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Qualcomm SLIMBus NGD controller");
