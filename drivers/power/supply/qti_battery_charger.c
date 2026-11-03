@@ -55,6 +55,7 @@
 /* Generic definitions */
 #define MAX_STR_LEN			128
 #define BC_WAIT_TIME_MS			1000
+#define BATT_REJECT_LIMIT		3
 #define WLS_FW_PREPARE_TIME_MS		1000
 #define WLS_FW_WAIT_TIME_MS		500
 #define WLS_FW_UPDATE_TIME_MS		1000
@@ -286,6 +287,8 @@ struct battery_chg_dev {
 	bool				initialized;
 	bool				notify_en;
 	bool				error_prop;
+	/* Rejections in a row of each battery property by the firmware */
+	u8				batt_rejects[BATT_PROP_MAX];
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -805,6 +808,8 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 					struct battery_chg_dev, usb_type_work);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
 	int rc;
+
+	memset(bcdev->batt_rejects, 0, sizeof(bcdev->batt_rejects));
 
 	rc = read_property_id(bcdev, pst, USB_ADAP_TYPE);
 	if (rc < 0) {
@@ -1407,7 +1412,22 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	if (prop_id < 0)
 		return prop_id;
 
+	/*
+	 * Stop asking for a property the firmware keeps rejecting, like
+	 * current_avg on sky, which userspace otherwise polls every few
+	 * seconds. A charger plug or a firmware restart asks again.
+	 */
+	if (bcdev->batt_rejects[prop_id] >= BATT_REJECT_LIMIT)
+		return -ENODATA;
+
 	rc = read_property_id(bcdev, pst, prop_id);
+	if (rc == -ENODATA) {
+		if (++bcdev->batt_rejects[prop_id] == BATT_REJECT_LIMIT)
+			pr_info("Firmware rejects battery prop_id %d, not asking again\n",
+				prop_id);
+	} else if (!rc) {
+		bcdev->batt_rejects[prop_id] = 0;
+	}
 	if (rc < 0)
 		return rc;
 
@@ -1549,6 +1569,7 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 					struct battery_chg_dev, subsys_up_work);
 	int rc;
 
+	memset(bcdev->batt_rejects, 0, sizeof(bcdev->batt_rejects));
 	battery_chg_notify_enable(bcdev);
 
 	/*
