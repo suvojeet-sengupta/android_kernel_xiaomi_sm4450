@@ -84,7 +84,6 @@ obj-$(CONFIG_QCOM_MEM_BUF) += mem_buf/
 obj-$(CONFIG_QPNP_PBS) += qpnp-pbs.o
 obj-$(CONFIG_QCOM_SECURE_BUFFER) += secure_buffer.o
 obj-$(CONFIG_QCOM_MEM_HOOKS) += mem-hooks.o
-obj-$(CONFIG_QCOM_MEM_OFFLINE) += mem-offline.o
 obj-$(CONFIG_USB_BAM) += usb_bam.o
 obj-$(CONFIG_QCOM_CPU_VENDOR_HOOKS) += qcom_cpu_vendor_hooks.o
 obj-$(CONFIG_SPS) += sps/
