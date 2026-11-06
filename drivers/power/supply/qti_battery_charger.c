@@ -661,9 +661,14 @@ static bool validate_message(struct battery_chg_dev *bcdev,
 	}
 
 	if (resp_msg->ret_code) {
-		pr_err_ratelimited("Error in response for opcode %#x prop_id %u, rc=%d\n",
-			resp_msg->hdr.opcode, resp_msg->property_id,
-			(int)resp_msg->ret_code);
+		static DECLARE_BITMAP(reported, 64 * 64);
+		unsigned int bit = ((resp_msg->hdr.opcode & 0x3f) << 6) |
+				   (resp_msg->property_id & 0x3f);
+
+		if (!test_and_set_bit(bit, reported))
+			pr_err("Error in response for opcode %#x prop_id %u, rc=%d\n",
+				resp_msg->hdr.opcode, resp_msg->property_id,
+				(int)resp_msg->ret_code);
 		bcdev->error_prop = true;
 		return false;
 	}
