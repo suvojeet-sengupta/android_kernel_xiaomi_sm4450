@@ -1473,8 +1473,10 @@ int cfg80211_set_monitor_channel(struct cfg80211_registered_device *rdev,
 {
 	if (!rdev->ops->set_monitor_channel)
 		return -EOPNOTSUPP;
-	if (!cfg80211_has_monitors_only(rdev))
-		return -EBUSY;
+	/*
+	 * NetHunter: let userspace change the monitor channel even when
+	 * another normal virtual interface is using the device.
+	 */
 
 	return rdev_set_monitor_channel(rdev, chandef);
 }
