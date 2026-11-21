@@ -20,6 +20,7 @@
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 #include <linux/thermal.h>
+#include <linux/math64.h>
 #include <linux/workqueue.h>
 #include <linux/soc/qcom/qti_pmic_glink.h>
 #include <linux/soc/qcom/battery_charger.h>
@@ -242,6 +243,13 @@ struct psy_state {
 	u32			opcode_set;
 };
 
+/* A temperature smart charging keeps under a ceiling, and how fast it rises */
+struct smart_chg_sensor {
+	int				last;		/* decidegrees C */
+	unsigned long			last_jiffies;
+	int				rate;		/* decidegrees C/min, x16 */
+};
+
 struct battery_chg_dev {
 	struct device			*dev;
 	struct class			battery_class;
@@ -290,14 +298,19 @@ struct battery_chg_dev {
 	bool				error_prop;
 	/* Rejections in a row of each battery property by the firmware */
 	u8				batt_rejects[BATT_PROP_MAX];
-	/* Smart charging: hold the battery under a target temperature */
+	/* Smart charging: charge fast, but keep battery and skin under a ceiling */
 	struct delayed_work		smart_chg_work;
 	bool				smart_chg_en;
 	int				smart_chg_temp;
-	int				smart_chg_last_temp;
+	int				smart_chg_skin_temp;
+	struct smart_chg_sensor		smart_chg_batt;
+	struct smart_chg_sensor		smart_chg_skin;
+	const char			*smart_chg_skin_zone;
+	struct thermal_zone_device	*smart_chg_skin_tz;
 	u32				smart_chg_fcc_ua;
 	u32				smart_chg_min_fcc_ua;
 	u32				smart_chg_step_ua;
+	u32				smart_chg_down_ua;
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -1415,31 +1428,87 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 /*
  * Smart charging
  *
- * Charge at the full current the charger firmware allows while the battery
- * is cool, and only pull the charge current back as the battery nears the
- * target temperature, so it settles just under the target instead of
- * stepping down through fixed thermal levels. The temperature is checked
- * every SMART_CHG_POLL_MS while charging, and on every battery or USB
- * notification from the charger firmware, which also arrive in suspend.
+ * Charge as fast as the charger firmware allows while that keeps the battery
+ * and the skin under their ceilings (40 C and 41 C by default), instead of
+ * stepping the current down through fixed thermal levels.
+ *
+ * Every SMART_CHG_POLL_MS while charging, and on each battery or USB
+ * notification from the charger firmware (they also arrive in suspend), each
+ * sensor is read and its temperature projected SMART_CHG_HORIZON_MIN minutes
+ * ahead from a smoothed rise rate. A sensor allows the full current while its
+ * projection is at least SMART_CHG_BAND below its ceiling, and less in
+ * proportion as the projection closes in, down to the minimum current at the
+ * ceiling. Looking ahead lets the current come down before the battery is
+ * hot rather than after, so it can stay at full speed for longer. The current
+ * follows the lower of the two limits gently: it eases off by at most the
+ * down step (1 A by default) per poll as things warm up and is given back
+ * one step (250 mA) per poll as they cool down, so the loop neither jumps
+ * nor oscillates. Only at the ceiling plus SMART_CHG_PANIC_BAND does it go
+ * straight to the minimum.
  *
  * Temperatures are in decidegrees Celsius, as POWER_SUPPLY_PROP_TEMP.
  */
 #define SMART_CHG_POLL_MS		5000
-#define SMART_CHG_TEMP_DEFAULT		390
+#define SMART_CHG_TEMP_DEFAULT		400
+#define SMART_CHG_SKIN_TEMP_DEFAULT	410
 #define SMART_CHG_TEMP_MIN		300
 #define SMART_CHG_TEMP_MAX		450
-/* Start easing off this far below the target, if the battery is warming */
-#define SMART_CHG_EASE_BAND		10
-/* Give current back once the battery is this far below the target */
-#define SMART_CHG_RECOVER_BAND		20
-/* Drop straight to the minimum this far above the target */
-#define SMART_CHG_PANIC_BAND		30
+/* Full current while the projection is this far under the ceiling */
+#define SMART_CHG_BAND			12
+/* Minimum current at once this far over the ceiling */
+#define SMART_CHG_PANIC_BAND		15
+#define SMART_CHG_HORIZON_MIN		2
+/* Readings closer together than this don't update the rise rate */
+#define SMART_CHG_RATE_MIN_MS		2000
 #define SMART_CHG_MIN_FCC_UA_DEFAULT	500000
 #define SMART_CHG_STEP_UA_DEFAULT	250000
+#define SMART_CHG_DOWN_UA_DEFAULT	1000000
 
 static u32 smart_chg_max_fcc_ua(struct battery_chg_dev *bcdev)
 {
 	return bcdev->psy_list[PSY_TYPE_BATTERY].prop[BATT_CHG_CTRL_LIM_MAX];
+}
+
+static void smart_chg_sensor_reset(struct smart_chg_sensor *s)
+{
+	s->last = INT_MIN;
+	s->rate = 0;
+}
+
+/* The charge current @s allows at @temp under @ceiling */
+static u32 smart_chg_sensor_limit(struct smart_chg_sensor *s, int temp,
+				  int ceiling, u32 min_ua, u32 max_ua)
+{
+	unsigned long now = jiffies;
+	unsigned int dt_ms;
+	int inst, proj, head;
+
+	if (s->last == INT_MIN) {
+		s->last = temp;
+		s->last_jiffies = now;
+	} else {
+		dt_ms = jiffies_to_msecs(now - s->last_jiffies);
+		if (dt_ms >= SMART_CHG_RATE_MIN_MS) {
+			inst = div_s64((s64)(temp - s->last) * 16 * 60000, dt_ms);
+			/* Exponential average over about four readings */
+			s->rate += (inst - s->rate) / 4;
+			s->last = temp;
+			s->last_jiffies = now;
+		}
+	}
+
+	if (temp >= ceiling + SMART_CHG_PANIC_BAND)
+		return min_ua;
+
+	/* Look ahead only while warming; cooling is not credited early */
+	proj = temp + DIV_ROUND_UP(max(s->rate, 0) * SMART_CHG_HORIZON_MIN, 16);
+	head = ceiling - proj;
+	if (head <= 0)
+		return min_ua;
+	if (head >= SMART_CHG_BAND)
+		return max_ua;
+
+	return min_ua + div_u64((u64)(max_ua - min_ua) * head, SMART_CHG_BAND);
 }
 
 static void smart_chg_apply(struct battery_chg_dev *bcdev, u32 fcc_ua)
@@ -1467,6 +1536,29 @@ static void smart_chg_kick(struct battery_chg_dev *bcdev)
 				 &bcdev->smart_chg_work, 0);
 }
 
+/* The skin temperature in decidegrees C, or INT_MIN without a skin sensor */
+static int smart_chg_read_skin(struct battery_chg_dev *bcdev)
+{
+	struct thermal_zone_device *tz = bcdev->smart_chg_skin_tz;
+	int mdeg;
+
+	if (!bcdev->smart_chg_skin_zone)
+		return INT_MIN;
+
+	/* Thermal zones can register after this driver probes */
+	if (!tz) {
+		tz = thermal_zone_get_zone_by_name(bcdev->smart_chg_skin_zone);
+		if (IS_ERR(tz))
+			return INT_MIN;
+		bcdev->smart_chg_skin_tz = tz;
+	}
+
+	if (thermal_zone_get_temp(tz, &mdeg))
+		return INT_MIN;
+
+	return mdeg / 100;
+}
+
 static void battery_chg_smart_chg_work(struct work_struct *work)
 {
 	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
@@ -1474,9 +1566,11 @@ static void battery_chg_smart_chg_work(struct work_struct *work)
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	u32 max_ua = smart_chg_max_fcc_ua(bcdev);
 	u32 min_ua = min(bcdev->smart_chg_min_fcc_ua, max_ua);
-	u32 step = bcdev->smart_chg_step_ua;
 	u32 fcc_ua = bcdev->smart_chg_fcc_ua;
-	int target = bcdev->smart_chg_temp;
+	u32 step = bcdev->smart_chg_step_ua;
+	u32 down = bcdev->smart_chg_down_ua;
+	bool panic;
+	u32 want;
 	int temp, rc;
 
 	if (!READ_ONCE(bcdev->smart_chg_en) || !max_ua)
@@ -1488,8 +1582,9 @@ static void battery_chg_smart_chg_work(struct work_struct *work)
 
 	if (pst->prop[BATT_STATUS] != POWER_SUPPLY_STATUS_CHARGING) {
 		/* Start the next charge at full speed, then wait to be kicked */
+		smart_chg_sensor_reset(&bcdev->smart_chg_batt);
+		smart_chg_sensor_reset(&bcdev->smart_chg_skin);
 		smart_chg_apply(bcdev, max_ua);
-		bcdev->smart_chg_last_temp = INT_MIN;
 		return;
 	}
 
@@ -1498,21 +1593,24 @@ static void battery_chg_smart_chg_work(struct work_struct *work)
 		goto again;
 
 	temp = DIV_ROUND_CLOSEST((int)pst->prop[BATT_TEMP], 10);
+	panic = temp >= bcdev->smart_chg_temp + SMART_CHG_PANIC_BAND;
+	want = smart_chg_sensor_limit(&bcdev->smart_chg_batt, temp,
+				      bcdev->smart_chg_temp, min_ua, max_ua);
 
-	if (temp >= target + SMART_CHG_PANIC_BAND) {
-		fcc_ua = min_ua;
-	} else if (temp >= target) {
-		fcc_ua = fcc_ua > min_ua + 2 * step ? fcc_ua - 2 * step : min_ua;
-	} else if (temp >= target - SMART_CHG_EASE_BAND) {
-		if (temp > bcdev->smart_chg_last_temp)
-			fcc_ua = fcc_ua > min_ua + step ? fcc_ua - step : min_ua;
-	} else if (temp < target - SMART_CHG_RECOVER_BAND) {
-		fcc_ua = fcc_ua + step < max_ua ? fcc_ua + step : max_ua;
+	temp = smart_chg_read_skin(bcdev);
+	if (temp != INT_MIN) {
+		panic |= temp >= bcdev->smart_chg_skin_temp + SMART_CHG_PANIC_BAND;
+		want = min(want, smart_chg_sensor_limit(&bcdev->smart_chg_skin,
+				temp, bcdev->smart_chg_skin_temp, min_ua, max_ua));
 	}
 
-	fcc_ua = clamp(fcc_ua, min_ua, max_ua);
-	bcdev->smart_chg_last_temp = temp;
-	smart_chg_apply(bcdev, fcc_ua);
+	/* Ease off a down step at a time and give back one step, unless hot */
+	if (want > fcc_ua)
+		want = min(want, fcc_ua + step);
+	else if (!panic && fcc_ua - want > down)
+		want = fcc_ua - down;
+
+	smart_chg_apply(bcdev, clamp(want, min_ua, max_ua));
 
 again:
 	queue_delayed_work(system_power_efficient_wq, &bcdev->smart_chg_work,
@@ -1534,9 +1632,10 @@ static int smart_chg_set_enable(struct battery_chg_dev *bcdev, bool en)
 		return rc < 0 ? rc : 0;
 	}
 
-	/* Begin at full speed; the work pulls it back if the battery is hot */
+	/* Begin at full speed; the work pulls it back if it gets warm */
 	bcdev->smart_chg_fcc_ua = smart_chg_max_fcc_ua(bcdev);
-	bcdev->smart_chg_last_temp = INT_MIN;
+	smart_chg_sensor_reset(&bcdev->smart_chg_batt);
+	smart_chg_sensor_reset(&bcdev->smart_chg_skin);
 	WRITE_ONCE(bcdev->smart_chg_en, true);
 	smart_chg_kick(bcdev);
 
@@ -2252,6 +2351,35 @@ static ssize_t smart_chg_temp_show(const struct class *c,
 }
 static CLASS_ATTR_RW(smart_chg_temp);
 
+static ssize_t smart_chg_skin_temp_store(const struct class *c,
+				const struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || val < SMART_CHG_TEMP_MIN ||
+	    val > SMART_CHG_TEMP_MAX)
+		return -EINVAL;
+
+	bcdev->smart_chg_skin_temp = val;
+	smart_chg_kick(bcdev);
+
+	return count;
+}
+
+static ssize_t smart_chg_skin_temp_show(const struct class *c,
+				const struct class_attribute *attr,
+				char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->smart_chg_skin_temp);
+}
+static CLASS_ATTR_RW(smart_chg_skin_temp);
+
 static ssize_t smart_chg_fcc_show(const struct class *c,
 				const struct class_attribute *attr,
 				char *buf)
@@ -2586,6 +2714,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_restrict_cur.attr,
 	&class_attr_smart_chg.attr,
 	&class_attr_smart_chg_temp.attr,
+	&class_attr_smart_chg_skin_temp.attr,
 	&class_attr_smart_chg_fcc.attr,
 	&class_attr_usb_real_type.attr,
 	&class_attr_usb_typec_compliant.attr,
@@ -2651,7 +2780,21 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 			     &bcdev->smart_chg_step_ua);
 	if (!bcdev->smart_chg_step_ua)
 		bcdev->smart_chg_step_ua = SMART_CHG_STEP_UA_DEFAULT;
-	bcdev->smart_chg_last_temp = INT_MIN;
+	bcdev->smart_chg_down_ua = SMART_CHG_DOWN_UA_DEFAULT;
+	of_property_read_u32(node, "xiaomi,smart-chg-down-ua",
+			     &bcdev->smart_chg_down_ua);
+	if (!bcdev->smart_chg_down_ua)
+		bcdev->smart_chg_down_ua = SMART_CHG_DOWN_UA_DEFAULT;
+	of_property_read_string(node, "xiaomi,smart-chg-skin-zone",
+				&bcdev->smart_chg_skin_zone);
+	bcdev->smart_chg_skin_temp = SMART_CHG_SKIN_TEMP_DEFAULT;
+	of_property_read_u32(node, "xiaomi,smart-chg-skin-temp",
+			     (u32 *)&bcdev->smart_chg_skin_temp);
+	bcdev->smart_chg_skin_temp = clamp(bcdev->smart_chg_skin_temp,
+					   SMART_CHG_TEMP_MIN,
+					   SMART_CHG_TEMP_MAX);
+	smart_chg_sensor_reset(&bcdev->smart_chg_batt);
+	smart_chg_sensor_reset(&bcdev->smart_chg_skin);
 
 	rc = read_property_id(bcdev, pst, BATT_CHG_CTRL_LIM_MAX);
 	if (rc < 0) {
