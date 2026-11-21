@@ -20,6 +20,7 @@
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 #include <linux/thermal.h>
+#include <linux/workqueue.h>
 #include <linux/soc/qcom/qti_pmic_glink.h>
 #include <linux/soc/qcom/battery_charger.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
@@ -289,6 +290,14 @@ struct battery_chg_dev {
 	bool				error_prop;
 	/* Rejections in a row of each battery property by the firmware */
 	u8				batt_rejects[BATT_PROP_MAX];
+	/* Smart charging: hold the battery under a target temperature */
+	struct delayed_work		smart_chg_work;
+	bool				smart_chg_en;
+	int				smart_chg_temp;
+	int				smart_chg_last_temp;
+	u32				smart_chg_fcc_ua;
+	u32				smart_chg_min_fcc_ua;
+	u32				smart_chg_step_ua;
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -921,6 +930,8 @@ static void battery_chg_check_status_work(struct work_struct *work)
 	kernel_power_off();
 }
 
+static void smart_chg_kick(struct battery_chg_dev *bcdev);
+
 static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 				size_t len)
 {
@@ -948,10 +959,12 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 		pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 		if (bcdev->shutdown_volt_mv > 0)
 			schedule_work(&bcdev->battery_check_work);
+		smart_chg_kick(bcdev);
 		break;
 	case BC_USB_STATUS_GET:
 		pst = &bcdev->psy_list[PSY_TYPE_USB];
 		schedule_work(&bcdev->usb_type_work);
+		smart_chg_kick(bcdev);
 		break;
 	case BC_WLS_STATUS_GET:
 		pst = &bcdev->psy_list[PSY_TYPE_WLS];
@@ -1344,6 +1357,9 @@ static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 {
 	int rc;
 
+	if (READ_ONCE(bcdev->smart_chg_en))
+		fcc_ua = min_t(u32, fcc_ua, READ_ONCE(bcdev->smart_chg_fcc_ua));
+
 	if (bcdev->restrict_chg_en) {
 		fcc_ua = min_t(u32, fcc_ua, bcdev->restrict_fcc_ua);
 		fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
@@ -1394,6 +1410,137 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 		bcdev->thermal_fcc_ua = prev_fcc_ua;
 
 	return rc;
+}
+
+/*
+ * Smart charging
+ *
+ * Charge at the full current the charger firmware allows while the battery
+ * is cool, and only pull the charge current back as the battery nears the
+ * target temperature, so it settles just under the target instead of
+ * stepping down through fixed thermal levels. The temperature is checked
+ * every SMART_CHG_POLL_MS while charging, and on every battery or USB
+ * notification from the charger firmware, which also arrive in suspend.
+ *
+ * Temperatures are in decidegrees Celsius, as POWER_SUPPLY_PROP_TEMP.
+ */
+#define SMART_CHG_POLL_MS		5000
+#define SMART_CHG_TEMP_DEFAULT		390
+#define SMART_CHG_TEMP_MIN		300
+#define SMART_CHG_TEMP_MAX		450
+/* Start easing off this far below the target, if the battery is warming */
+#define SMART_CHG_EASE_BAND		10
+/* Give current back once the battery is this far below the target */
+#define SMART_CHG_RECOVER_BAND		20
+/* Drop straight to the minimum this far above the target */
+#define SMART_CHG_PANIC_BAND		30
+#define SMART_CHG_MIN_FCC_UA_DEFAULT	500000
+#define SMART_CHG_STEP_UA_DEFAULT	250000
+
+static u32 smart_chg_max_fcc_ua(struct battery_chg_dev *bcdev)
+{
+	return bcdev->psy_list[PSY_TYPE_BATTERY].prop[BATT_CHG_CTRL_LIM_MAX];
+}
+
+static void smart_chg_apply(struct battery_chg_dev *bcdev, u32 fcc_ua)
+{
+	int rc;
+
+	if (fcc_ua == READ_ONCE(bcdev->smart_chg_fcc_ua))
+		return;
+
+	pr_debug("smart charging: FCC %u -> %u uA\n",
+		 bcdev->smart_chg_fcc_ua, fcc_ua);
+	WRITE_ONCE(bcdev->smart_chg_fcc_ua, fcc_ua);
+
+	/* The thermal limit is the full current when nothing mitigates */
+	rc = __battery_psy_set_charge_current(bcdev, bcdev->thermal_fcc_ua);
+	if (rc < 0)
+		pr_err("smart charging: Failed to set FCC %u uA, rc=%d\n",
+		       fcc_ua, rc);
+}
+
+static void smart_chg_kick(struct battery_chg_dev *bcdev)
+{
+	if (READ_ONCE(bcdev->smart_chg_en))
+		mod_delayed_work(system_power_efficient_wq,
+				 &bcdev->smart_chg_work, 0);
+}
+
+static void battery_chg_smart_chg_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
+					struct battery_chg_dev, smart_chg_work);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	u32 max_ua = smart_chg_max_fcc_ua(bcdev);
+	u32 min_ua = min(bcdev->smart_chg_min_fcc_ua, max_ua);
+	u32 step = bcdev->smart_chg_step_ua;
+	u32 fcc_ua = bcdev->smart_chg_fcc_ua;
+	int target = bcdev->smart_chg_temp;
+	int temp, rc;
+
+	if (!READ_ONCE(bcdev->smart_chg_en) || !max_ua)
+		return;
+
+	rc = read_property_id(bcdev, pst, BATT_STATUS);
+	if (rc < 0)
+		goto again;
+
+	if (pst->prop[BATT_STATUS] != POWER_SUPPLY_STATUS_CHARGING) {
+		/* Start the next charge at full speed, then wait to be kicked */
+		smart_chg_apply(bcdev, max_ua);
+		bcdev->smart_chg_last_temp = INT_MIN;
+		return;
+	}
+
+	rc = read_property_id(bcdev, pst, BATT_TEMP);
+	if (rc < 0)
+		goto again;
+
+	temp = DIV_ROUND_CLOSEST((int)pst->prop[BATT_TEMP], 10);
+
+	if (temp >= target + SMART_CHG_PANIC_BAND) {
+		fcc_ua = min_ua;
+	} else if (temp >= target) {
+		fcc_ua = fcc_ua > min_ua + 2 * step ? fcc_ua - 2 * step : min_ua;
+	} else if (temp >= target - SMART_CHG_EASE_BAND) {
+		if (temp > bcdev->smart_chg_last_temp)
+			fcc_ua = fcc_ua > min_ua + step ? fcc_ua - step : min_ua;
+	} else if (temp < target - SMART_CHG_RECOVER_BAND) {
+		fcc_ua = fcc_ua + step < max_ua ? fcc_ua + step : max_ua;
+	}
+
+	fcc_ua = clamp(fcc_ua, min_ua, max_ua);
+	bcdev->smart_chg_last_temp = temp;
+	smart_chg_apply(bcdev, fcc_ua);
+
+again:
+	queue_delayed_work(system_power_efficient_wq, &bcdev->smart_chg_work,
+			   msecs_to_jiffies(SMART_CHG_POLL_MS));
+}
+
+static int smart_chg_set_enable(struct battery_chg_dev *bcdev, bool en)
+{
+	int rc;
+
+	if (en == bcdev->smart_chg_en)
+		return 0;
+
+	if (!en) {
+		WRITE_ONCE(bcdev->smart_chg_en, false);
+		cancel_delayed_work_sync(&bcdev->smart_chg_work);
+		rc = __battery_psy_set_charge_current(bcdev,
+				bcdev->thermal_fcc_ua);
+		return rc < 0 ? rc : 0;
+	}
+
+	/* Begin at full speed; the work pulls it back if the battery is hot */
+	bcdev->smart_chg_fcc_ua = smart_chg_max_fcc_ua(bcdev);
+	bcdev->smart_chg_last_temp = INT_MIN;
+	WRITE_ONCE(bcdev->smart_chg_en, true);
+	smart_chg_kick(bcdev);
+
+	return 0;
 }
 
 static int battery_psy_get_prop(struct power_supply *psy,
@@ -1591,6 +1738,9 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 			pr_err("Failed to set FCC (%u uA), rc=%d\n",
 				bcdev->last_fcc_ua, rc);
 	}
+
+	/* The charger firmware restarted, so check the temperature again */
+	smart_chg_kick(bcdev);
 
 	if (bcdev->usb_icl_ua) {
 		rc = usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT,
@@ -2045,6 +2195,75 @@ static ssize_t restrict_chg_show(const struct class *c,
 }
 static CLASS_ATTR_RW(restrict_chg);
 
+static ssize_t smart_chg_store(const struct class *c,
+				const struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	bool val;
+	int rc;
+
+	if (kstrtobool(buf, &val))
+		return -EINVAL;
+
+	rc = smart_chg_set_enable(bcdev, val);
+
+	return rc < 0 ? rc : count;
+}
+
+static ssize_t smart_chg_show(const struct class *c,
+				const struct class_attribute *attr,
+				char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->smart_chg_en);
+}
+static CLASS_ATTR_RW(smart_chg);
+
+static ssize_t smart_chg_temp_store(const struct class *c,
+				const struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || val < SMART_CHG_TEMP_MIN ||
+	    val > SMART_CHG_TEMP_MAX)
+		return -EINVAL;
+
+	bcdev->smart_chg_temp = val;
+	smart_chg_kick(bcdev);
+
+	return count;
+}
+
+static ssize_t smart_chg_temp_show(const struct class *c,
+				const struct class_attribute *attr,
+				char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->smart_chg_temp);
+}
+static CLASS_ATTR_RW(smart_chg_temp);
+
+static ssize_t smart_chg_fcc_show(const struct class *c,
+				const struct class_attribute *attr,
+				char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 READ_ONCE(bcdev->smart_chg_fcc_ua));
+}
+static CLASS_ATTR_RO(smart_chg_fcc);
+
 static ssize_t fake_soc_store(const struct class *c,
 				const struct class_attribute *attr,
 				const char *buf, size_t count)
@@ -2365,6 +2584,9 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_ship_mode_en.attr,
 	&class_attr_restrict_chg.attr,
 	&class_attr_restrict_cur.attr,
+	&class_attr_smart_chg.attr,
+	&class_attr_smart_chg_temp.attr,
+	&class_attr_smart_chg_fcc.attr,
 	&class_attr_usb_real_type.attr,
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
@@ -2414,12 +2636,33 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 	of_property_read_u32(node, "xiaomi,input-suspend-prop",
 			     (u32 *)&bcdev->xm_input_suspend_prop);
 
+	bcdev->smart_chg_en = of_property_read_bool(node,
+						"xiaomi,smart-chg-enable");
+	bcdev->smart_chg_temp = SMART_CHG_TEMP_DEFAULT;
+	of_property_read_u32(node, "xiaomi,smart-chg-temp",
+			     (u32 *)&bcdev->smart_chg_temp);
+	bcdev->smart_chg_temp = clamp(bcdev->smart_chg_temp,
+				      SMART_CHG_TEMP_MIN, SMART_CHG_TEMP_MAX);
+	bcdev->smart_chg_min_fcc_ua = SMART_CHG_MIN_FCC_UA_DEFAULT;
+	of_property_read_u32(node, "xiaomi,smart-chg-min-fcc-ua",
+			     &bcdev->smart_chg_min_fcc_ua);
+	bcdev->smart_chg_step_ua = SMART_CHG_STEP_UA_DEFAULT;
+	of_property_read_u32(node, "xiaomi,smart-chg-step-ua",
+			     &bcdev->smart_chg_step_ua);
+	if (!bcdev->smart_chg_step_ua)
+		bcdev->smart_chg_step_ua = SMART_CHG_STEP_UA_DEFAULT;
+	bcdev->smart_chg_last_temp = INT_MIN;
+
 	rc = read_property_id(bcdev, pst, BATT_CHG_CTRL_LIM_MAX);
 	if (rc < 0) {
 		pr_err("Failed to read prop BATT_CHG_CTRL_LIM_MAX, rc=%d\n",
 			rc);
 		return rc;
 	}
+
+	/* Nothing limits the charge current until something mitigates */
+	bcdev->thermal_fcc_ua = pst->prop[BATT_CHG_CTRL_LIM_MAX];
+	bcdev->smart_chg_fcc_ua = pst->prop[BATT_CHG_CTRL_LIM_MAX];
 
 	rc = of_property_count_elems_of_size(node, "qcom,thermal-mitigation",
 						sizeof(u32));
@@ -2675,6 +2918,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_WORK(&bcdev->subsys_up_work, battery_chg_subsys_up_work);
 	INIT_WORK(&bcdev->usb_type_work, battery_chg_update_usb_type_work);
 	INIT_WORK(&bcdev->battery_check_work, battery_chg_check_status_work);
+	INIT_DELAYED_WORK(&bcdev->smart_chg_work, battery_chg_smart_chg_work);
 	bcdev->dev = dev;
 
 	rc = battery_chg_register_panel_notifier(bcdev);
@@ -2753,6 +2997,8 @@ static int battery_chg_probe(struct platform_device *pdev)
 	if (rc < 0)
 		pr_debug("Failed to read charge_control_en, rc = %d\n", rc);
 
+	smart_chg_kick(bcdev);
+
 	return 0;
 error:
 	down_write(&bcdev->state_sem);
@@ -2764,6 +3010,8 @@ error:
 	cancel_work_sync(&bcdev->usb_type_work);
 	cancel_work_sync(&bcdev->subsys_up_work);
 	cancel_work_sync(&bcdev->battery_check_work);
+	bcdev->smart_chg_en = false;
+	cancel_delayed_work_sync(&bcdev->smart_chg_work);
 	complete(&bcdev->ack);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
 reg_error:
@@ -2791,6 +3039,8 @@ static int battery_chg_remove(struct platform_device *pdev)
 	cancel_work_sync(&bcdev->subsys_up_work);
 	cancel_work_sync(&bcdev->usb_type_work);
 	cancel_work_sync(&bcdev->battery_check_work);
+	bcdev->smart_chg_en = false;
+	cancel_delayed_work_sync(&bcdev->smart_chg_work);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
 
 	return 0;
