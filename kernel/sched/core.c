@@ -1398,7 +1398,13 @@ static unsigned int __maybe_unused sysctl_sched_uclamp_util_max = SCHED_CAPACITY
  * This knob will not override the system default sched_util_clamp_min defined
  * above.
  */
-static unsigned int sysctl_sched_uclamp_util_min_rt_default = SCHED_CAPACITY_SCALE;
+/*
+ * sky: RT tasks get no default floor, as on Pixel. With the full floor every
+ * RT task (display commit, audio, GPU dispatcher, input) ran its CPU at the
+ * top frequency, and CASS, which honors the uclamp minimum, moved it to a big
+ * core to do so, so the big cores rarely left their top frequency.
+ */
+static unsigned int sysctl_sched_uclamp_util_min_rt_default;
 
 /* All clamps are required to be less or equal than these values */
 static struct uclamp_se uclamp_default[UCLAMP_CNT];
