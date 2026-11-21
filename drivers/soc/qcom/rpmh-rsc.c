@@ -1677,30 +1677,17 @@ static int rpmh_rsc_pd_callback(struct notifier_block *nfb,
 	return NOTIFY_OK;
 }
 
-static void rpmh_rsc_pd_detach(void *data)
-{
-	dev_pm_genpd_remove_notifier(data);
-}
-
 static int rpmh_rsc_pd_attach(struct rsc_drv *drv, struct device *dev)
 {
 	int ret;
 
-	ret = devm_pm_runtime_enable(dev);
-	if (ret)
-		return ret;
-
+	pm_runtime_enable(dev);
 	drv->genpd_nb.notifier_call = rpmh_rsc_pd_callback;
 	ret = dev_pm_genpd_add_notifier(dev, &drv->genpd_nb);
 	if (ret)
-		return ret;
+		pm_runtime_disable(dev);
 
-	return devm_add_action_or_reset(dev, rpmh_rsc_pd_detach, dev);
-}
-
-static void rpmh_rsc_cpu_pm_unregister(void *data)
-{
-	cpu_pm_unregister_notifier(data);
+	return ret;
 }
 
 static int rpmh_probe_tcs_config(struct rsc_drv *drv)

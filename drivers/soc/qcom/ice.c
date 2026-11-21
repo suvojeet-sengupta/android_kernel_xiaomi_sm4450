@@ -671,10 +671,6 @@ static struct qcom_ice *qcom_ice_create(struct device *dev,
 	engine->set_tpkey = of_property_read_bool(dev->of_node,
 						  "qcom,ice-hwkm-set-tpkey");
 
-	engine->iface_clk = devm_clk_get_optional_enabled(dev, "iface");
-	if (IS_ERR(engine->iface_clk))
-		return ERR_CAST(engine->iface_clk);
-
 	if (!qcom_ice_check_supported(engine))
 		return ERR_PTR(-EOPNOTSUPP);
 
