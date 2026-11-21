@@ -39,6 +39,7 @@
 #define QPNP_VIB_PLAY_MS		5000
 #define QPNP_VIB_MAX_PLAY_MS		15000
 #define QPNP_VIB_OVERDRIVE_PLAY_MS	30
+#define QPNP_VIB_OVERDRIVE_MAX_MS	100
 
 struct vib_ldo_chip {
 	struct led_classdev	cdev;
@@ -49,6 +50,7 @@ struct vib_ldo_chip {
 	u16			base;
 	int			vmax_uV;
 	int			overdrive_volt_uV;
+	u32			overdrive_ms;
 	int			ldo_uV;
 	int			state;
 	u64			vib_play_ms;
@@ -163,7 +165,7 @@ static int qpnp_vibrator_play_on(struct vib_ldo_chip *chip)
 
 	if (!chip->disable_overdrive)
 		hrtimer_start(&chip->overdrive_timer,
-			ms_to_ktime(QPNP_VIB_OVERDRIVE_PLAY_MS),
+			ms_to_ktime(chip->overdrive_ms),
 			HRTIMER_MODE_REL);
 
 	return ret;
@@ -254,6 +256,17 @@ static int qpnp_vib_parse_dt(struct device *dev, struct vib_ldo_chip *chip)
 
 	chip->disable_overdrive = of_property_read_bool(dev->of_node,
 					"qcom,disable-overdrive");
+
+	/*
+	 * How long each vibration starts at the overdrive voltage. Covering the
+	 * whole of a short tap or click with it makes those feel as strong as
+	 * the motor allows, while longer buzzes settle at the normal voltage.
+	 */
+	chip->overdrive_ms = QPNP_VIB_OVERDRIVE_PLAY_MS;
+	of_property_read_u32(dev->of_node, "qcom,vib-overdrive-ms",
+			     &chip->overdrive_ms);
+	chip->overdrive_ms = clamp_t(u32, chip->overdrive_ms, 1,
+				     QPNP_VIB_OVERDRIVE_MAX_MS);
 
 	if (of_find_property(dev->of_node, "qcom,vib-overdrive-volt-uv",
 			     NULL)) {
