@@ -471,11 +471,17 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 }
 #endif
 
-__read_mostly unsigned int sched_pelt_lshift;
+/*
+ * sky: boot with the 16 ms PELT half-life (multiplier 2). Without WALT and
+ * its input boost, schedutil only raises the clock as PELT sees the load, so
+ * the 32 ms default ramps too slowly after a touch. Userspace can still
+ * change it through kernel.sched_pelt_multiplier.
+ */
+__read_mostly unsigned int sched_pelt_lshift = 1;
 
 #ifdef CONFIG_SYSCTL
 #include <trace/hooks/sched.h>
-static unsigned int sysctl_sched_pelt_multiplier = 1;
+static unsigned int sysctl_sched_pelt_multiplier = 2;
 
 int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
 			  size_t *lenp, loff_t *ppos)
